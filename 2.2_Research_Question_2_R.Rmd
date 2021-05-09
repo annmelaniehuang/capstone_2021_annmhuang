@@ -1,0 +1,227 @@
+---
+title: "Research Question 2"
+output: html_document
+author: Anran Huang
+date: 10/05/2021
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading packages and the dataset, message=FALSE, warning=FALSE}
+# check package availability
+list.of.packages <- c("ggplot2", "epiDisplay", "ROSE", "caret" ,"effects", 
+                      "GGally", "compiler", "parallel", "devtools", "texreg", 
+                      "texreghelpr")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+#load packages
+library(nlme)
+library(ggplot2)
+library(lme4)
+library(nlme)
+library(dplyr)
+library(caret)
+library(tidyr)
+require(GGally)
+require(reshape2)
+require(compiler)
+require(parallel)
+require(boot)
+require(lattice)
+library(devtools)
+library(texreg)
+install_github("SarBearSchwartz/texreghelpr")
+library(texreghelpr)
+
+
+icudata <- read.csv('1_input/input_rq2.csv')
+paste(nrow(icudata), 'rows of data')
+paste(length(unique(icudata$icustay_id)), 'unique ICU stays in the dataset')
+paste(length(unique(icudata$hadm_id)), 'unique hospital admissions in the dataset')
+paste(length(unique(icudata$subject_id)), 'patients in the dataset')
+```
+
+## Data Preparation
+
+```{r data wrangling}
+colnames(icudata)[8] <- 'ICU_mortality'
+data_long <- icudata %>% 
+  group_by(hadm_id) %>% 
+  mutate(icustay_idx = row_number()) %>% ungroup() %>%
+  dplyr::mutate(hadm_id = factor(hadm_id),
+                subject_id = factor(subject_id),
+                age_bins = factor(age_bins, 
+                                  order = TRUE, 
+                                  levels = c("under44", "45-54", "55-64", "65-74", "over75")),
+                icu_adm_weekend = as.logical.factor((icu_adm_weekend),
+                                                    levels = c(FALSE, TRUE),
+                                                    labels = c("Weekday", "Weekend")),
+                ICU_mortality = as.factor(as.integer(as.integer(ICU_mortality)-1)),
+                ICU_mortality_int = as.integer(ICU_mortality),
+                icu_adm_weekend = factor((icu_adm_weekend),
+                                         levels = c(FALSE, TRUE),
+                                         labels = c("Weekday", "Weekend"))) %>%
+  select(-c(icustay_id)) %>%
+  dplyr::arrange(hadm_id, icustay_idx)
+str(data_long)
+```
+
+## Data Visualisation
+
+The longitudinal data set is seriously imbalanced. 93% of the cases are negative and only 7% are positive (i.e. ICU mortality).
+
+```{r icu_adm_weekend as fixed effect}
+round(prop.table(table(data_long$ICU_mortality)),3)
+```
+
+```{r why icu_adm_weekend as fixed effect}
+cross.tab <- xtabs(~icu_adm_weekend+ICU_mortality, data=data_long)
+icu.crosstab <- t(cross.tab[2:1,2:1])
+addmargins(icu.crosstab) #cross tab
+round(prop.table(icu.crosstab,1),3) # row perc
+round(prop.table(icu.crosstab,2),3) # column perc
+round(prop.table(icu.crosstab),3) # cell perc
+mosaicplot( t(icu.crosstab), col = c("firebrick", "goldenrod1"), cex.axis = 1, sub = "icu_adm_weekend", ylab = "Relative frequency", main = "")
+```
+```{r odds ratio and risk ratio}
+if (!require("epitools")) {install.packages("epitools", dependencies = TRUE, repos="http://cran.rstudio.com/")}
+library(epitools)
+cat("odds ratio: \n")
+oddsratio(icu.crosstab, method = "wald")$measure[-1,]
+cat("risk ratio: \n")
+riskratio(icu.crosstab, method = "wald", rev = "both")$measure[-1,]
+```
+```{r categorical viz}
+par(mfrow = c(3,3), mar=c(0.5, 0.5, 0.2, 0.2),
+     mai=c(.5,.6,.2,.2))
+loop.vector <- c("icustay_idx", "age_bins", "icu_adm_weekend", "re_adm_in30d", "insurance", "admission_type")
+
+for (i in loop.vector) {
+  cat(paste("Frequency Table for", i, '\n'))
+  print(epiDisplay::tab1(data_long[,c(i)], sort.group ='decreasing', cum.percent = FALSE, graph=TRUE, cex=0.8, bar.values='percent', main=paste("Bar Chart for",i)))
+}
+
+```
+
+```{r continuous viz}
+print(data_long %>% group_by(ICU_mortality) %>% 
+        summarise(median_los = median(los), 
+                  qntl_25 = quantile(los, 0.25),
+                  qntl_75 = quantile(los, 0.75),
+                  ))
+data_long %>%
+  ggplot(aes(x=ICU_mortality, y=los, fill=ICU_mortality)) +
+  geom_violin() + 
+  ylab("length of ICU stay in days") +
+  geom_boxplot(width=0.1, color="orange", fill='white', alpha=0.5)+ 
+  ylim(0, 5)+
+  #scale_y_continuous(limits = quantile(data_long$los, c(0, 0.9)))+
+  ggtitle("Violin and Box Plot for ICU Lenth of Stay vs ICU Mortality") +
+  xlab("")
+```
+
+## Chi-squared contingency test to test association between ICU weekend admission and ICU mortality rate
+
+```{r chi-sq test}
+icu_ChiTest <- chisq.test(data_long$ICU_mortality, data_long$icu_adm_weekend, correct = FALSE)
+icu_ChiTest
+addmargins(icu_ChiTest$expected)
+source("http://www.stat.wisc.edu/~st571-1/gtest.R")
+g.test(icu.crosstab)
+```
+
+## Under-sampling for Label Imbalance 
+
+```{r undersampling}
+data_long$age_group = as.integer(data_long$age_bins)
+sliced = data_long[,c("ICU_mortality", "hadm_id", "subject_id", "los", "age_group", "icu_adm_weekend", "re_adm_in30d", "insurance", "admission_type")]
+under_sample <- ROSE::ovun.sample(data=sliced, ICU_mortality ~ .,method = "under", N = 4323*2, seed = 1)$data
+```
+
+```{r age group as fixed effect}
+xtabs(~age_group+ICU_mortality, data=data_long)
+```
+
+## Simple Generalised Logistic Regression Model (SLR)
+
+```{r glm simple}
+model_slm0 <- glm(ICU_mortality ~ icu_adm_weekend, data = under_sample, family = binomial)
+# Summarize the model
+summary(model_slm0)
+model_slm0$coefficients
+confint(model_slm0)
+probabilities0 <-model_slm0 %>% predict(data_long, type = "response")
+predicted.classes0 <- ifelse(probabilities0 > 0.5, 1, 0)
+cat("model accuracy on predicting ICU mortality:", mean(predicted.classes0 == data_long$ICU_mortality))
+# use caret and compute a confusion matrix
+caret::confusionMatrix(data = as.factor(predicted.classes0), reference = data_long$ICU_mortality)
+```
+
+## Multilevel Linear Model for Binary Outcome (MLM)
+
+We are interested in investigating whether weekend ICU admission increases the risk of ICU mortality. 
+
+- RI: outcome may change for each hospital admission `icu_adm_weekend`;
+
+Random slope models are generally not recommended for binomial GLMMs.
+
+By comparing the log-likelihood of single-level intercept-only model and a variance-components (VC) model, it does appear the VC model with a random intercept is better than a single-level model. As expected, the confidence interval is wider for the VC model as the single-level is often over-confident. VPC of 0.6 at hospital admission level, which is not too large nor close to zero. It suggests that there is an impact on `ICU_mortality` by `hadm_id`, i.e. risk of `ICU_mortality` varies among `hadm_id`s.
+
+```{r variance-components vs single-level}
+under_sample$ICU_mortality = as.numeric(under_sample$ICU_mortality)
+mod.single <- lm(ICU_mortality ~ 1, data=under_sample)
+mod.vc.hosp <- lmer(ICU_mortality ~ (1|hadm_id), data=under_sample, REML=FALSE)
+mod.vc.pt <- lmer(ICU_mortality ~ (1|subject_id), data=under_sample, REML=FALSE)
+
+VPC.hosp <- VarCorr(mod.vc.hosp) %>% as_tibble() %>% mutate(icc=vcov/sum(vcov)) %>% select(grp, icc)
+VPC.pt <- VarCorr(mod.vc.pt) %>% as_tibble() %>% mutate(icc=vcov/sum(vcov)) %>% select(grp, icc)
+
+print(VPC.hosp[0:1,])
+print(VPC.pt[0:1,])
+
+logLik(mod.single)
+logLik(mod.vc.hosp)
+logLik(mod.vc.pt)
+
+confint(mod.single)
+confint(mod.vc.hosp)
+confint(mod.vc.pt)
+```
+
+```{r RI models}
+under_sample$ICU_mortality = as.factor(under_sample$ICU_mortality)
+# random intercept model 1
+mod1 <- glmer(ICU_mortality ~ icu_adm_weekend + (1|hadm_id), data=under_sample, family = binomial(link = "logit"))
+
+# additional model considering age_group
+mod2 <- glmer(ICU_mortality ~ icu_adm_weekend + age_group + (1|hadm_id), data=under_sample, family = binomial(link = "logit"))
+
+# additional model considering age_group * icu_adm_weekend
+mod3 <- glmer(ICU_mortality ~ icu_adm_weekend*age_group + (1|hadm_id), data=under_sample, family = binomial(link = "logit"))
+```
+
+```{r mlm 1 summary}
+confint(mod1)
+summary(mod1)
+logLik(mod1)
+logLik(model_slm0)
+plot(effects::allEffects(mod1))
+```
+```{r compare mlms with or without age_group}
+texreg::knitreg(list(mod1, mod2),
+                custom.model.names = c("without age group", "with age group"),
+                single.row = TRUE,
+                caption = "MLM Parameter Estimates: Inclusion of Age Group at Hospital Admission (SE and p-values)")
+plot(effects::allEffects(mod2))
+```
+```{r odds ratio scale comparison for mlms with or without age_group}
+texreg::knitreg(list(extract_glmer_exp(mod1), 
+                     extract_glmer_exp(mod2)),
+                custom.model.names = c("without age group", "with age group"),
+                ci.test = 1,
+                single.row = TRUE,
+                caption = "MLM Parameter Estimates: Inclusion of Age Group at Hospital Admission (95% CI's)")
+```
